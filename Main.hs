@@ -8,10 +8,15 @@ module Main where
 
 import           GHC.Generics (Generic)
 
+import           Data.Maybe
+
 import           Data.Bits    ((.&.), (.|.))
 import qualified Data.Bits    as Bits
 
 import           Data.List    (foldl')
+
+import           Data.Set     (Set)
+import qualified Data.Set     as Set
 
 (|>) :: a -> (a -> b) -> b
 (|>) = flip ($)
@@ -79,6 +84,7 @@ deriv a (r :.: s) = let d1 = deriv a r
 derivative :: (Eq tok, Foldable t) => t tok -> Regex tok -> Regex tok
 derivative tokens rx = foldr deriv rx tokens
 
+{-@ measure matchDeriv :: Regex tok -> [tok] -> Bool @-}
 -- | Match the given string against the given regular expression by taking the
 -- Brzozowski derivative.
 matchDeriv :: (Eq tok) => Regex tok -> [tok] -> Bool
@@ -90,6 +96,7 @@ type Natural = Int
 
 -- | The type representing states in an NFA.
 data NatSet = MkNatSet {-# UNPACK #-} !Natural !Integer
+            deriving (Eq, Ord, Generic)
 
 -- | FIXME: doc
 emptyNS :: NatSet
@@ -147,6 +154,10 @@ foldlNS f acc0 ns = go (rangeNS ns) acc0 (sizeNS ns) 0
                   | containsNS ns b      = go (d - 1) (f acc b) (n - 1) (b + 1)
                   | otherwise            = go (d - 1) acc       n       (b + 1)
 
+-- | FIXME: doc
+unionsNS :: (Foldable t) => t NatSet -> NatSet
+unionsNS = foldr unionNS emptyNS
+
 -- | The type representing an NFA.
 --
 -- This type and many of the functions using it are based on Gabriel Gonzalez's
@@ -162,6 +173,7 @@ data NFA tok
     , nfaAccepting  :: NatSet
       -- ^ The set of accepting states.
     }
+  deriving (Generic)
 
 -- | Match a sequence of tokens against an NFA.
 matchNFA :: NFA tok -> [tok] -> Bool
@@ -213,40 +225,65 @@ sequenceNFA (MkNFA nL asL fL bsL) (MkNFA nR asR fR bsR) = MkNFA n as f bs
                     else x ∪ shiftNS nL asR
                else shiftNS nL (fR i (s - nL))
 
-data DFA tok
+{- measure dfaStates :: DFA st tok -> Set st @-}
+
+{-@
+data DFA st tok
   = MkDFA
-    { dfaNumStates  :: Natural
-      -- ^ The number of states.
-    , dfaStarting   :: Natural
+    { dfaStates     :: Set st
+    , dfaStarting   :: {q : st | Set_mem q dfaStates}
+    , dfaTransition :: tok
+                    -> {qI : st | Set_mem qI dfaStates}
+                    -> {qO : st | Set_mem qO dfaStates}
+    , dfaAccepting  :: {q : st | Set_mem q dfaStates} -> Bool
+    }
+@-}
+
+data DFA st tok
+  = MkDFA
+    { dfaStates     :: Set st
+      -- ^ The set of states.
+    , dfaStarting   :: st
       -- ^ The starting state.
-    , dfaTransition :: tok -> Natural -> Natural
+    , dfaTransition :: tok -> st -> st
       -- ^ The transition function.
-    , dfaAccepting  :: NatSet
+    , dfaAccepting  :: st -> Bool
       -- ^ The accepting states.
     }
+  deriving (Generic)
 
--- | The free NFA corresponding to a given DFA.
-fromDFAtoNFA :: DFA tok -> NFA tok
-fromDFAtoNFA (MkDFA n s f acc) = let f' t q = singletonNS (f t q)
-                                 in MkNFA n (singletonNS s) f' acc
+{-@ autosize DFA @-}
+
+{-@ type VState dfa = {q : _ | Prop (Set_mem q (dfaStates dfa))} @-}
+
+-- | The "free" NFA corresponding to a given DFA.
+fromDFAtoNFA :: (Ord st) => DFA st tok -> NFA tok
+fromDFAtoNFA (MkDFA ss s f acc) = MkNFA (Set.size ss) s' f' acc'
+  where
+    s'   = toNS s
+    f'   = \t q -> toNS $ f t (toSt q)
+    acc' = unionsNS $ map toNS $ filter acc $ Set.toList ss
+    toSt n = Set.elemAt n ss
+    toNS q = singletonNS $ Set.findIndex q ss
 
 -- | The powerset DFA corresponding to a given NFA.
-fromNFAtoDFA :: NFA tok -> DFA tok
-fromNFAtoDFA (MkNFA n as f bs) = MkDFA (2 ^ n) _ _ _ -- FIXME
+fromNFAtoDFA :: NFA tok -> DFA NatSet tok
+fromNFAtoDFA (MkNFA n as f bs) = MkDFA ss _ _ _ -- FIXME
+  where
+    ss :: Set NatSet
+    ss = _
 
 -- | Minimizes the number of states in the given DFA.
-minimizeDFA :: DFA tok -> DFA tok
-minimizeDFA (MkDFA n s f acc) = _ -- FIXME
+minimizeDFA :: DFA st tok -> DFA st tok
+ -- FIXME: use a better DFA minimization algorithm
+minimizeDFA (MkDFA ss s f acc) = MkDFA ss s f acc
 
 -- | The complement of a given DFA.
-complementDFA :: DFA tok -> DFA tok
-complementDFA (MkDFA n s f acc) = MkDFA n s f acc'
-  where
-    acc' = foldr unionNS emptyNS
-           [singletonNS k | k <- [0 .. n - 1], not (containsNS acc k)]
+complementDFA :: DFA st tok -> DFA st tok
+complementDFA (MkDFA ss s f acc) = MkDFA ss s f (acc .> not)
 
 -- | The intersection of two DFAs.
-intersectionDFA :: DFA tok -> DFA tok -> DFA tok
+intersectionDFA :: DFA st tok -> DFA st tok -> DFA (st, st) tok
 intersectionDFA (MkDFA nL sL fL accL) (MkDFA nR sR fR accR) = MkDFA n s f acc
   where
     -- FIXME
@@ -283,7 +320,7 @@ thompson (r :.: s) = sequenceNFA (thompson r) (thompson s)
 {-@ matchRegex
       :: rx:(Regex tok)
       -> str:[tok]
-      -> {v : Bool | ((Prop v) <=> (Prop (matchDeriv rx str))) }
+      -> {v : Bool | ((Prop v) <=> (Prop (matchDeriv rx str)))}
 @-}
 matchRegex :: (Eq tok) => Regex tok -> [tok] -> Bool
 matchRegex rx toks = matchNFA (thompson rx) toks
