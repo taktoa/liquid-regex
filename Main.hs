@@ -6,7 +6,9 @@
 module Main where
 
 import           GHC.Generics (Generic)
--- import           ProofCombinators
+
+import           Data.Set     (Set)
+import qualified Data.Set     as Set
 
 -- | The type of generalized regular expressions over a given alphabet.
 data Regex tok
@@ -33,51 +35,19 @@ data Regex tok
 -- | Returns true if the language of the given regular expression contains Ɛ,
 --   and otherwise returns false.
 isNullable :: Regex tok -> Bool
-isNullable Ø           = False
-isNullable Ɛ           = True
-isNullable (Tok _)     = False
-isNullable (Comp r)    = not (isNullable r)
-isNullable (Star r)    = True
-isNullable ((:|:) r s) = isNullable r || isNullable s
-isNullable ((:&:) r s) = isNullable r && isNullable s
-isNullable ((:.:) r s) = isNullable r && isNullable s
+isNullable Ø         = False
+isNullable Ɛ         = True
+isNullable (Tok _)   = False
+isNullable (Comp r)  = not (isNullable r)
+isNullable (Star r)  = True
+isNullable (r :|: s) = isNullable r || isNullable s
+isNullable (r :&: s) = isNullable r && isNullable s
+isNullable (r :.: s) = isNullable r && isNullable s
 
 -- | Returns Ɛ if the language of the given regular expression contains Ɛ, and
 --   otherwise returns Ø.
 nullable :: Regex tok -> Regex tok
 nullable r = if isNullable r then Ɛ else Ø
-
-{-@ type Fin n a = {xs : [a] | ((len xs) <= k)} @-}
-
-{-@ assume splitAt
-    :: forall a. k:Nat
-    -> xs:(Fin k a)
-    -> {p : ([a], [a]) | (k = (len (fst p)))
-                         && ((len xs) = (len (fst p) + len (snd p)))} @-}
-
-{- inline myAny -}
-myAny :: (a -> Bool) -> [a] -> Bool
-myAny _ []     = False
-myAny f (x:xs) = f x || myAny f xs
-
--- {- range :: lower:Int -> upper:Int -> [{x : Int | (lower <= x) && (x <= upper)}] -}
--- range :: Int -> Int -> [Int]
--- range = \lower upper -> reverse (go lower upper)
---   where
---     {- go :: lower:Int -> upper:Int -> [{x : Int | (lower <= x) && (x <= upper)}] / [upper] -}
---     go :: Int -> Int -> [Int]
---     go lower upper = if lower <= upper then [] else upper : go lower (upper - 1)
-
--- {- axiomatize matches -}
--- {- matches :: [tok] -> rx:(Regex tok) -> Bool / [autolen rx] -}
--- matches :: (Eq tok) => [tok] -> Regex tok -> Bool
--- matches []  Ɛ         = True
--- matches [a] (Tok tok) = tok == a
--- matches str (r :|: s) = matches str r || matches str s
--- matches str (r :&: s) = matches str r && matches str s
--- matches str (r :.: s) = myAny (\(a, b) -> matches a r && matches b s)
---                         $ map (\i -> splitAt i str) [0 .. length str]
--- matches _   _         = False
 
 -- | The Brzozowski derivative of a regular expression with respect to a token.
 deriv :: (Eq tok) => tok -> Regex tok -> Regex tok
@@ -98,15 +68,90 @@ deriv a (r :.: s) = let d1 = deriv a r
 derivative :: (Eq tok, Foldable t) => t tok -> Regex tok -> Regex tok
 derivative tokens rx = foldr deriv rx tokens
 
-{-
-derivWorks
-  :: x:tok
-  -> xs:[tok]
-  -> rx:(Regex tok)
-  -> {v : Proof | (Prop (matches (x:xs) rx)) <=> (Prop (matches xs (deriv x rx))) }
--}
--- derivWorks :: tok -> [tok] -> Regex tok -> ()
--- derivWorks x xs rx = trivial *** QED
+-- | A refinement type alias for Int.
+type Natural = Int
+{-@ type Natural = Nat @-}
+
+-- | The type representing states in an NFA.
+type NFAState = Natural
+
+-- | The type representing an NFA.
+--
+-- This type and many of the functions using it are based on Gabriel Gonzalez's
+-- <http://github.com/Gabriel439/slides/blob/master/regex/regex.md notes>.
+data NFA tok
+  = MkNFA
+    { numStates  :: Natural
+      -- ^ The number of states.
+    , starting   :: Set NFAState
+      -- ^ The set of starting states.
+    , transition :: tok -> NFAState -> Set NFAState
+      -- ^ The transition function.
+    , accepting  :: Set NFAState
+      -- ^ The set of accepting states.
+    }
+
+-- | Match a sequence of tokens against an NFA.
+matchNFA :: NFA tok -> [tok] -> Bool
+matchNFA (MkNFA _ as _ bs) []     = not (Set.null (Set.intersection as bs))
+matchNFA (MkNFA n as f bs) (i:is) = let as' = Set.unions (f i <$> Set.elems as)
+                                    in matchNFA (MkNFA n as' f bs) is
+
+-- | The NFA that accepts a single token if it satisfies a given predicate.
+satisfy :: (tok -> Bool) -> NFA tok
+satisfy predicate = MkNFA n as f bs
+  where
+    n = 2
+    as = Set.singleton 0
+    bs = Set.singleton 0
+    f t s = if (s == 0) && predicate t then Set.singleton 1 else Set.empty
+
+thompson :: forall tok. (Eq tok) => Regex tok -> NFA tok
+thompson = go
+  where
+    go :: Regex tok -> NFA tok
+    go Ø         = empNFA
+    go Ɛ         = epsNFA
+    go (Tok t)   = satisfy (== t)
+    go (Comp r)  = error "complement not supported :("
+    go (Star r)  = let MkNFA n as f bs = thompson r
+                       f' i s = let x = f i s
+                                in if Set.null (Set.intersection x bs)
+                                   then x
+                                   else Set.union x as
+                   in MkNFA n as f' bs
+    go (r :|: s) = let MkNFA nL asL fL bsL = thompson r
+                       MkNFA nR asR fR bsR = thompson s
+                       n = nL + nR
+                       as = Set.union asL (shift nL asR)
+                       bs = Set.union bsL (shift nL bsR)
+                       f i s | s < nL    = fL i s
+                             | otherwise = shift nL (fR i (s - nL))
+                   in MkNFA n as f bs
+    go (r :&: s) = error "intersection not supported :("
+    go (r :.: s) = let MkNFA nL asL fL bsL = thompson r
+                       MkNFA nR asR fR bsR = thompson s
+                       n = nL + nR
+                       as = Set.union asL
+                            (if Set.null (Set.intersection asL bsL)
+                             then Set.empty
+                             else shift nL asR)
+                       bs = shift nL bsR
+                       f i s = let x = fL i s
+                               in if s < nL
+                                  then if Set.null (Set.intersection x bsL)
+                                       then x
+                                       else Set.union x (shift nL asR)
+                                  else shift nL (fR i (s - nL))
+                   in MkNFA n as f bs
+
+    empNFA, epsNFA :: NFA tok
+    empNFA = MkNFA 0 Set.empty (\_ _ -> Set.empty) Set.empty
+    epsNFA = MkNFA 1 (Set.singleton 0) (\_ _ -> Set.empty) (Set.singleton 0)
+
+    shift :: Int -> Set NFAState -> Set NFAState
+    shift n = Set.fromAscList . map (+ n) . Set.toAscList
+
 
 main :: IO ()
 main = pure ()
