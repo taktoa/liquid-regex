@@ -268,10 +268,23 @@ fromDFAtoNFA (MkDFA ss s f acc) = MkNFA (Set.size ss) s' f' acc'
 
 -- | The powerset DFA corresponding to a given NFA.
 fromNFAtoDFA :: NFA tok -> DFA NatSet tok
-fromNFAtoDFA (MkNFA n as f bs) = MkDFA ss _ _ _ -- FIXME
+fromNFAtoDFA (MkNFA n as f bs) = MkDFA ss as f' (== bs) -- FIXME
   where
+    f' tok st = fromNS st |> Set.map (f tok) |> unionsNS
+
     ss :: Set NatSet
-    ss = _
+    ss = [0 .. (n - 1)] |> powerset |> Set.map toNS
+
+    powerset :: (Ord a) => [a] -> Set (Set a)
+    powerset []     = Set.singleton Set.empty
+    powerset (x:xs) = let xs' = powerset xs
+                      in Set.union xs' (Set.map (Set.insert x) xs')
+
+    fromNS :: NatSet -> Set Natural
+    fromNS = foldlNS (flip (:)) [] .> Set.fromList
+
+    toNS :: Set Natural -> NatSet
+    toNS = Set.map singletonNS .> unionsNS
 
 -- | Minimizes the number of states in the given DFA.
 minimizeDFA :: DFA st tok -> DFA st tok
@@ -283,14 +296,13 @@ complementDFA :: DFA st tok -> DFA st tok
 complementDFA (MkDFA ss s f acc) = MkDFA ss s f (acc .> not)
 
 -- | The intersection of two DFAs.
-intersectionDFA :: DFA st tok -> DFA st tok -> DFA (st, st) tok
-intersectionDFA (MkDFA nL sL fL accL) (MkDFA nR sR fR accR) = MkDFA n s f acc
+intersectionDFA :: (Ord st) => DFA st tok -> DFA st tok -> DFA (st, st) tok
+intersectionDFA (MkDFA ssL sL fL accL) (MkDFA ssR sR fR accR) = MkDFA ss s f acc
   where
-    -- FIXME
-    n   = _
-    s   = _
-    f   = _
-    acc = _
+    ss  = Set.fromList [(x, y) | x <- Set.toList ssL, y <- Set.toList ssR]
+    s   = (sL, sR)
+    f   = \t (a, b) -> (fL t a, fR t b)
+    acc = \(a, b) -> accL a && accR b
 
 -- | The complement of a given NFA.
 complementNFA :: NFA tok -> NFA tok
